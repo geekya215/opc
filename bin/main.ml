@@ -1,113 +1,212 @@
-type 'a result = Ok of 'a | Err of string
+module Input = struct
+  type position = {line: int; column: int}
 
-type 'a parser = Parser of (string -> ('a * string) result)
+  let init_pos = {line= 0; column= 0}
 
-let composition f g x = g (f x)
+  let incr_col pos = {pos with column= pos.column + 1}
 
-let ( >>| ) = composition
+  let incr_line pos = {line= pos.line + 1; column= 0}
 
-let pchar charToMatch =
-  let innerFn str =
-    match str with
-    | "" -> Err "No more input"
-    | _ ->
-        let first = str.[0] in
-        if first = charToMatch then
-          Ok (charToMatch, String.sub str 1 (String.length str - 1))
+  type state = {lines: string list; position: position}
+
+  let cur_line state =
+    let line_pos = state.position.line in
+    if line_pos < List.length state.lines then List.nth state.lines line_pos
+    else "end of file"
+
+  let from_string str =
+    if str = "" then {lines= []; position= init_pos}
+    else
+      let lines = String.split_on_char '\n' str in
+      {lines; position= init_pos}
+
+  let next_char input =
+    let line_pos = input.position.line in
+    let col_pos = input.position.column in
+    if line_pos >= List.length input.lines then (input, None)
+    else
+      let current_line = cur_line input in
+      if col_pos < String.length current_line then
+        let c = String.get current_line col_pos in
+        let new_pos = incr_col input.position in
+        let new_state = {input with position= new_pos} in
+        (new_state, Some c)
+      else
+        let c = '\n' in
+        let new_pos = incr_line input.position in
+        let new_state = {input with position= new_pos} in
+        (new_state, Some c)
+end
+
+let compose f g x = g (f x)
+
+type state = Input.state
+
+type parser_position = {current_line: string; line: int; column: int}
+
+type 'a result = Ok of 'a | Err of string * string * parser_position
+
+type 'a parser = {fn: state -> ('a * state) result; label: string}
+
+let run_on_input parser input = parser.fn input
+
+let run parser str = run_on_input parser (Input.from_string str)
+
+let parser_pos_from_state state =
+  { current_line= Input.cur_line state
+  ; line= state.position.line
+  ; column= state.position.column }
+
+let print_result = function
+  | Ok (value, _) -> value
+  | Err (label, error, parser_pos) ->
+      let error_line = parser_pos.current_line in
+      let col_pos = parser_pos.column in
+      let line_pos = parser_pos.line in
+      let failure_caret = Printf.sprintf "%*s^%s" col_pos "" error in
+      failwith
+      @@ Printf.sprintf "Line:%i Col:%i Error parsing %s\n%s\n%s" line_pos
+           col_pos label error_line failure_caret
+
+let get_label parser = parser.label
+
+let set_label parser new_label =
+  let inner_fn input =
+    let res = parser.fn input in
+    match res with
+    | Ok (_, _) as o -> o
+    | Err (_, error, pos) -> Err (new_label, error, pos)
+  in
+  {fn= inner_fn; label= new_label}
+
+let ( <?> ) = set_label
+
+let satisfy pred label =
+  let inner_fn input =
+    let remaining, c = Input.next_char input in
+    match c with
+    | None ->
+        let error = "No more input" in
+        let pos = parser_pos_from_state input in
+        Err (label, error, pos)
+    | Some first ->
+        if pred first then Ok (first, remaining)
         else
-          Err (Printf.sprintf "Expecting '%c'. Got '%c'" charToMatch first)
+          let error = Printf.sprintf "Unexpected '%c'" first in
+          let pos = parser_pos_from_state input in
+          Err (label, error, pos)
   in
-  Parser innerFn
+  {fn= inner_fn; label}
 
-let run parser input =
-  let (Parser innerFn) = parser in
-  innerFn input
-
-let bindP f p =
+let bind f p =
+  let label = "unknown" in
   let innerFn input =
-    let result1 = run p input in
-    match result1 with
-    | Err _ as e -> e
-    | Ok (value1, remainingInput) -> run (f value1) remainingInput
+    match run_on_input p input with
+    | Err (_, _, _) as e -> e
+    | Ok (v, remaining) ->
+        let p2 = f v in
+        run_on_input p2 remaining
   in
-  Parser innerFn
+  {fn= innerFn; label}
 
-let ( >>= ) p f = bindP f p
+let ( >>= ) p f = bind f p
 
-let returnP x =
-  let innerFn input = Ok (x, input) in
-  Parser innerFn
+let return x =
+  let inner_fn input = Ok (x, input) in
+  {fn= inner_fn; label= "hwo to do this?"}
 
-let mapP f = bindP (f >>| returnP)
+let map f = bind (compose f return)
 
-let ( <!> ) = mapP
+let ( <!> ) = map
 
-let ( |>> ) x f = mapP f x
+let ( |>> ) x f = map f x
 
-let applyP fP xP = fP >>= fun f -> xP >>= fun x -> returnP (f x)
+let apply f x = f >>= fun f -> x >>= fun x -> return (f x)
 
-let ( <*> ) = applyP
+let ( <*> ) = apply
 
-let lift2 f xP yP = returnP f <*> xP <*> yP
+let lift2 f x y = return f <*> x <*> y
 
-let andThen p1 p2 =
-  p1 >>= fun p1Result -> p2 >>= fun p2Result -> returnP (p1Result, p2Result)
+let and_then p1 p2 =
+  let label = Printf.sprintf "%s andThen %s" (get_label p1) (get_label p2) in
+  p1 >>= (fun r1 -> p2 >>= fun r2 -> return (r1, r2)) <?> label
 
-let ( >> ) = andThen
+let ( >> ) = and_then
 
-let orElse p1 p2 =
-  let innerFn input =
-    let result1 = run p1 input in
-    match result1 with Ok _ -> result1 | Err _ -> run p2 input
+let or_else p1 p2 =
+  let label = Printf.sprintf "%s orElse %s" (get_label p1) (get_label p2) in
+  let inner_fn input =
+    let r1 = run_on_input p1 input in
+    match r1 with
+    | Ok _ -> r1
+    | Err _ ->
+        let r2 = run_on_input p2 input in
+        r2
   in
-  Parser innerFn
+  {fn= inner_fn; label}
 
-let ( <|> ) = orElse
+let ( <|> ) = or_else
 
-let rec choice listOfParsers =
-  match listOfParsers with
-  | [] -> Parser (fun _ -> Err "empty")
+let rec choice parsers =
+  match parsers with
+  | [] ->
+      { fn=
+          (fun _ ->
+            Err ("empty", "empty", {current_line= ""; line= 0; column= 0}) )
+      ; label= "no more input" }
   | x :: xs -> x <|> choice xs
 
-let anyOf listOfChars = listOfChars |> List.map pchar |> choice
-
-let rec sequence parserList =
+let rec sequence parsers =
   let cons head tail = head :: tail in
-  let consP = lift2 cons in
-  match parserList with
-  | [] -> returnP []
-  | head :: tail -> consP head (sequence tail)
+  let cons_parser = lift2 cons in
+  match parsers with
+  | [] -> return []
+  | head :: tail -> cons_parser head (sequence tail)
 
-let rec parseZeroOrMore parser input =
-  let firstResult = run parser input in
-  match firstResult with
-  | Err _ -> ([], input)
-  | Ok (firstValue, inputAfterFirstParse) ->
-      let subsequentValues, remainingInput =
-        parseZeroOrMore parser inputAfterFirstParse
+let rec parse_zero_or_more parser input =
+  let first_result = run_on_input parser input in
+  match first_result with
+  | Err (_, _, _) -> ([], input)
+  | Ok (first_value, input_after_first_parse) ->
+      let sub_value, remaining =
+        parse_zero_or_more parser input_after_first_parse
       in
-      let values = firstValue :: subsequentValues in
-      (values, remainingInput)
+      let values = first_value :: sub_value in
+      (values, remaining)
 
 let many parser =
-  let innerFn input = Ok (parseZeroOrMore parser input) in
-  Parser innerFn
+  let label = Printf.sprintf "many %s" (get_label parser) in
+  let inner_fn input = Ok (parse_zero_or_more parser input) in
+  {fn= inner_fn; label}
 
-let many1 p = p >>= fun head -> many p >>= fun tail -> returnP (head :: tail)
+let many1 p =
+  let label = Printf.sprintf "many1 %s" (get_label p) in
+  p >>= (fun head -> many p >>= fun tail -> return (head :: tail)) <?> label
 
 let opt p =
+  let label = Printf.sprintf "opt %s" (get_label p) in
   let some = p |>> Option.some in
-  let none = returnP None in
-  some <|> none
+  let none = return None in
+  some <|> none <?> label
 
-let ( <$ ) p1 p2 = p1 >> p2 |> mapP (fun (a, _) -> a)
+let ( <$ ) p1 p2 = p1 >> p2 |> map (fun (a, _) -> a)
 
-let ( $> ) p1 p2 = p1 >> p2 |> mapP (fun (_, b) -> b)
+let ( $> ) p1 p2 = p1 >> p2 |> map (fun (_, b) -> b)
 
 let between p1 p2 p3 = p1 $> p2 <$ p3
 
-let sepBy1 p sep =
-  let sepThenP = sep $> p in
-  p >> many sepThenP |>> fun (p, pList) -> p :: pList
+let sep_by1 p sep =
+  let sep_then = sep $> p in
+  p >> many sep_then |>> fun (p, rest) -> p :: rest
 
-let sepBy p sep = sepBy1 p sep <|> returnP []
+let sep_by p sep = sep_by1 p sep <|> return []
+
+let pchar c =
+  let label = Printf.sprintf "%c" c in
+  let predicate ch = ch = c in
+  satisfy predicate label
+
+let any_of chars =
+  (* %A *)
+  let label = "any_of" in
+  chars |> List.map pchar |> choice <?> label
